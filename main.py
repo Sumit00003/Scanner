@@ -3,23 +3,23 @@
 main.py — Mini Scanner Orchestrator
 ======================================
 
-Runs the four checks in scanners.py against every URL in a target file:
+Runs the checks in scanners.py against every URL in a target file:
 
   1. CORS misconfiguration
-  2. Missing security headers  (renders PNG + txt evidence if vulnerable;
-     no Burp replay for this check)
-  3. Server banner + dangerous HTTP method disclosure (still replayed
-     through Burp for secondary PoC when vulnerable)
-  4. Clickjacking — ONLY runs the PoC/screenshot step if the target has
-     no X-Frame-Options AND no CSP frame-ancestors protection. For the
-     FIRST vulnerable target found, opens the PoC in a live browser and
-     takes a screenshot. Every subsequent vulnerable target still gets
-     its own PoC HTML saved, but the browser/screenshot are skipped —
-     it's just flagged as vulnerable in the console.
+  2. Security headers — missing AND misconfigured (weak values), renders
+     PNG + txt evidence if vulnerable
+  3. Server banner + dangerous HTTP method disclosure
+  4. TRACE method / Cross-Site Tracing (XST) — actively sends TRACE with
+     a marker header and checks if it's reflected back
+  5. Clickjacking — only runs PoC/screenshot for the FIRST vulnerable
+     target; later vulnerable targets are just flagged (no browser/screenshot)
 
-Console output is intentionally concise: one line per check with a
-colored verdict, plus a short list of key findings — not a full header
-dump. Full detail always goes to the evidence files on disk.
+Cross-cutting:
+  - Rate limiting (--rate-limit) applies to every outbound request.
+  - --token / --header / --cookie let you supply auth upfront.
+  - On a 401, the scan pauses once, asks for a token/cookie/header
+    interactively, retries that check, and reuses the credential for
+    the rest of the run (no more prompting after that).
 
 Requirements:
     pip install requests pillow
@@ -27,9 +27,10 @@ Requirements:
 
 Usage:
     python main.py -f urls.txt
-    python main.py -f urls.txt --out-dir ./evidence
-    python main.py -f urls.txt --no-burp
-    python main.py -f urls.txt --active-test     # actively sends dangerous HTTP methods
+    python main.py -f urls.txt --rate-limit 3
+    python main.py -f urls.txt --token "eyJhbGciOi..."
+    python main.py -f urls.txt --header "X-Api-Key: abc123" --header "X-Custom: val"
+    python main.py -f urls.txt --cookie "session=abc123; other=val"
 """
 
 import argparse
@@ -49,6 +50,7 @@ class C:
     RED = "\033[91m"
     GREEN = "\033[92m"
     YELLOW = "\033[93m"
+    ORANGE = "\033[38;5;208m"
     BLUE = "\033[94m"
     MAGENTA = "\033[95m"
     CYAN = "\033[96m"
@@ -84,10 +86,51 @@ def bullet(msg: str, color=C.YELLOW):
 
 
 # =====================================================================
+# 401 handling
+# =====================================================================
+def prompt_for_auth() -> dict:
+    """Interactively ask for a credential when a 401 is hit. Accepts:
+      - a raw token (assumed Bearer)
+      - "Header-Name: value" (used verbatim)
+    Returns a headers dict (possibly empty if the user skips)."""
+    print(c("\n  [!] Received 401 Unauthorized.", C.YELLOW + C.BOLD))
+    raw = input(c("      Enter a Bearer token, a full header ('Name: value'), "
+                  "or press Enter to skip: ", C.YELLOW)).strip()
+    if not raw:
+        return {}
+    if ":" in raw:
+        name, _, value = raw.partition(":")
+        return {name.strip(): value.strip()}
+    return {"Authorization": f"Bearer {raw}"}
+
+
+def with_auth_retry(check_fn, url: str, args, auth_state: dict, **kwargs):
+    """Call check_fn(url, ..., extra_headers=auth_state['headers']); if the
+    result's status_code is 401 and we haven't already asked this run,
+    prompt once, merge the credential into auth_state, and retry."""
+    result = check_fn(url, extra_headers=auth_state["headers"],
+                       rate_limiter=auth_state["rate_limiter"], **kwargs)
+
+    status = getattr(result, "status_code", None)
+    if status == 401 and not auth_state["asked"]:
+        auth_state["asked"] = True
+        new_headers = prompt_for_auth()
+        if new_headers:
+            auth_state["headers"].update(new_headers)
+            print(c("      Retrying with supplied credential...", C.GRAY))
+            result = check_fn(url, extra_headers=auth_state["headers"],
+                               rate_limiter=auth_state["rate_limiter"], **kwargs)
+        else:
+            print(c("      No credential supplied — continuing unauthenticated.", C.GRAY))
+
+    return result
+
+
+# =====================================================================
 # Checks
 # =====================================================================
-def run_cors(url: str, args):
-    result = scanners.check_cors(url, timeout=args.timeout)
+def run_cors(url: str, args, auth_state: dict):
+    result = with_auth_retry(scanners.check_cors, url, args, auth_state, timeout=args.timeout)
     if result.error:
         verdict_line("CORS", False, f"error: {result.error}")
         return result
@@ -101,18 +144,27 @@ def run_cors(url: str, args):
     return result
 
 
-def run_security_headers(url: str, args):
-    result = scanners.check_security_headers(url, timeout=args.timeout, verify=not args.insecure)
+def run_security_headers(url: str, args, auth_state: dict):
+    result = with_auth_retry(scanners.check_security_headers, url, args, auth_state,
+                              timeout=args.timeout, verify=not args.insecure)
     if result.error:
         verdict_line("Security Headers", False, f"error: {result.error}")
         return result
 
-    verdict_line("Security Headers", result.vulnerable,
-                  f"{len(result.missing)} missing" if result.vulnerable else "all present")
+    detail_parts = []
+    if result.missing:
+        detail_parts.append(f"{len(result.missing)} missing")
+    if result.misconfigured:
+        detail_parts.append(f"{len(result.misconfigured)} misconfigured")
+    detail = ", ".join(detail_parts) if detail_parts else "all present and properly configured"
+
+    verdict_line("Security Headers", result.vulnerable, detail)
 
     if result.vulnerable:
         for h in result.missing[:6]:
-            bullet(h, C.RED)
+            bullet(f"missing: {h}", C.RED)
+        for h, reason in list(result.misconfigured.items())[:6]:
+            bullet(f"misconfigured: {h} — {reason}", C.ORANGE)
 
         out_dir = args.out_dir
         Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -125,9 +177,10 @@ def run_security_headers(url: str, args):
     return result
 
 
-def run_recon(url: str, args):
-    methods = scanners.check_methods(url, timeout=args.timeout, active_test=args.active_test)
-    banners = scanners.check_banners(url, timeout=args.timeout)
+def run_recon(url: str, args, auth_state: dict):
+    methods = with_auth_retry(scanners.check_methods, url, args, auth_state,
+                               timeout=args.timeout, active_test=args.active_test)
+    banners = with_auth_retry(scanners.check_banners, url, args, auth_state, timeout=args.timeout)
 
     result = scanners.ReconResult(url=url, methods=methods, banners=banners)
 
@@ -150,7 +203,8 @@ def run_recon(url: str, args):
         print(c(f"        evidence: {path}", C.GRAY))
 
         if not args.no_burp:
-            err = scanners.send_through_burp(url, args.burp, timeout=args.timeout, methods=["OPTIONS", "GET"])
+            err = scanners.send_through_burp(url, args.burp, timeout=args.timeout, methods=["OPTIONS", "GET"],
+                                              extra_headers=auth_state["headers"])
             if err:
                 print(c(f"        [!] Burp replay failed: {err}", C.GRAY))
             else:
@@ -159,8 +213,21 @@ def run_recon(url: str, args):
     return result
 
 
-def run_clickjack(url: str, args, state: dict):
-    check = scanners.check_clickjack_headers(url, timeout=args.timeout)
+def run_trace_xst(url: str, args, auth_state: dict):
+    result = with_auth_retry(scanners.check_trace_xst, url, args, auth_state, timeout=args.timeout)
+    if result.error:
+        verdict_line("TRACE / XST", False, f"error: {result.error}")
+        return result
+
+    verdict_line("TRACE / XST", result.vulnerable, result.reason)
+    if result.vulnerable:
+        path = scanners.save_trace_evidence(result, args.out_dir)
+        print(c(f"        evidence: {path}", C.GRAY))
+    return result
+
+
+def run_clickjack(url: str, args, auth_state: dict, state: dict):
+    check = with_auth_retry(scanners.check_clickjack_headers, url, args, auth_state, timeout=args.timeout)
     if check.error:
         verdict_line("Clickjacking", False, f"error: {check.error}")
         return check
@@ -168,12 +235,11 @@ def run_clickjack(url: str, args, state: dict):
     verdict_line("Clickjacking", check.vulnerable, check.reason)
 
     if not check.vulnerable:
-        # Protected — per spec, skip PoC/screenshot generation entirely.
         return check
 
     is_first_encounter = state["screenshot_target"] is None
     take_screenshot = (not args.no_screenshot) and is_first_encounter
-    open_browser = is_first_encounter  # only pop the browser once, for the first vulnerable target
+    open_browser = is_first_encounter
 
     poc_result = scanners.run_clickjack_poc(
         url, args.out_dir,
@@ -183,7 +249,7 @@ def run_clickjack(url: str, args, state: dict):
     print(c(f"        PoC: {poc_result.poc_path}", C.GRAY))
 
     if is_first_encounter:
-        state["screenshot_target"] = url  # marks that we've already done the browser+screenshot pass
+        state["screenshot_target"] = url
         if open_browser:
             print(c(f"        opened in browser for live PoC", C.GRAY))
         if take_screenshot:
@@ -202,12 +268,28 @@ def run_clickjack(url: str, args, state: dict):
 # =====================================================================
 # Driver
 # =====================================================================
-def process_url(url: str, args, state: dict):
+def process_url(url: str, args, auth_state: dict, state: dict):
     print_target(url)
-    run_cors(url, args)
-    run_security_headers(url, args)
-    run_recon(url, args)
-    run_clickjack(url, args, state)
+    run_cors(url, args, auth_state)
+    run_security_headers(url, args, auth_state)
+    run_recon(url, args, auth_state)
+    run_trace_xst(url, args, auth_state)
+    run_clickjack(url, args, auth_state, state)
+
+
+def parse_custom_headers(header_args, token_arg, cookie_arg) -> dict:
+    headers = {}
+    for h in header_args or []:
+        if ":" not in h:
+            print(c(f"[!] Ignoring malformed --header value (expected 'Name: value'): {h}", C.YELLOW))
+            continue
+        name, _, value = h.partition(":")
+        headers[name.strip()] = value.strip()
+    if token_arg:
+        headers["Authorization"] = f"Bearer {token_arg}"
+    if cookie_arg:
+        headers["Cookie"] = cookie_arg
+    return headers
 
 
 def main():
@@ -222,6 +304,12 @@ def main():
     parser.add_argument("--no-screenshot", action="store_true", help="Don't auto-screenshot the clickjack PoC")
     parser.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     parser.add_argument("--timeout", type=int, default=10)
+    parser.add_argument("--rate-limit", type=float, default=5.0,
+                         help="Max requests per second across all checks (default 5, 0 = unlimited)")
+    parser.add_argument("--token", help="Bearer token to send as 'Authorization: Bearer <token>' on every request")
+    parser.add_argument("--cookie", help="Raw Cookie header value to send on every request")
+    parser.add_argument("--header", action="append",
+                         help="Custom header 'Name: value' to send on every request (repeatable)")
     args = parser.parse_args()
 
     url_file = Path(args.file).resolve()
@@ -239,6 +327,7 @@ def main():
     print_banner()
     print(c(f"[*] Targets: {len(urls)}", C.BLUE))
     print(c(f"[*] Evidence directory: {args.out_dir}", C.BLUE))
+    print(c(f"[*] Rate limit: {args.rate_limit if args.rate_limit > 0 else 'unlimited'} req/s", C.BLUE))
 
     if not args.no_burp:
         host, _, port = args.burp.partition(":")
@@ -253,18 +342,27 @@ def main():
         print(c("[!] --active-test is ON: dangerous HTTP methods will actually be sent. "
                 "Ensure this is authorized scope.", C.YELLOW + C.BOLD))
 
+    initial_headers = parse_custom_headers(args.header, args.token, args.cookie)
+    if initial_headers:
+        print(c(f"[*] Custom headers supplied: {', '.join(initial_headers.keys())}", C.BLUE))
+
+    auth_state = {
+        "headers": initial_headers,
+        "asked": False,
+        "rate_limiter": scanners.RateLimiter(args.rate_limit),
+    }
     state = {"screenshot_target": None, "additional_vulnerable": []}
 
     for url in urls:
-        process_url(url, args, state)
+        process_url(url, args, auth_state, state)
 
     print("\n" + c("=" * 70, C.CYAN))
     print(c("[+] Scan complete.", C.CYAN + C.BOLD))
     if state["screenshot_target"]:
-        print(c(f"[*] Clickjacking screenshot captured for: {state['screenshot_target']}", C.CYAN))
+        print(c(f"[*] Clickjacking PoC/screenshot captured for: {state['screenshot_target']}", C.CYAN))
     if state["additional_vulnerable"]:
         print(c(f"[!] {len(state['additional_vulnerable'])} additional URL(s) also vulnerable to "
-                f"clickjacking (screenshot skipped, PoC HTML still saved for each):", C.YELLOW))
+                f"clickjacking (browser/screenshot skipped, PoC HTML still saved for each):", C.YELLOW))
         for u in state["additional_vulnerable"]:
             print(c(f"      - {u}", C.YELLOW))
     print(c("=" * 70, C.CYAN))
