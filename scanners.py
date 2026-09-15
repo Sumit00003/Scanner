@@ -52,6 +52,12 @@ import requests
 from requests.exceptions import RequestException
 import urllib3
 
+from Banner/libfinder import (
+    create_session, get_js_files, download_all, detect_all,
+    ScopeResolver, extract_domains, detect_graphql,
+    detect_websockets, analyze_comments, correlate,
+)
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 DEFAULT_TIMEOUT = 10
