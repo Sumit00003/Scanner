@@ -1,6 +1,7 @@
 import json
 import re
 from pathlib import Path
+from libfinder import create_session, normalize_url
 
 
 VERSION_CAPTURE = r"([0-9A-Za-z._+\-]+)"
