@@ -1,22 +1,23 @@
 """
 libfinder.py
-Consolidated core: crawler + downloader + detector + scope + domain +
-graphql + websocket + comments + correlator + CLI.
-
-Security analyzers (secrets, entropy, crypto, endpoints) live in
-security.py and are wired into the CLI + Correlator here.
+All discovery + analysis for JS recon. Library only -- no CLI.
+Public API:
+    get_js_files, download_all, detect_all
+    ScopeResolver, extract_domains, detect_graphql, detect_websockets
+    analyze_comments, run_security_analysis
+    CallGraph, build_call_graph, SourceMapParser, parse_source_maps
 """
 from __future__ import annotations
 
-import argparse
+import base64
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import sys
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin, urlparse, urldefrag
 
@@ -25,11 +26,9 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from security import run_security_analysis
-
 
 # ============================================================
-# Shared config
+# Config
 # ============================================================
 
 HEADERS = {
@@ -46,22 +45,21 @@ DEFAULT_WORKERS = 10
 
 
 def create_session():
-    session = requests.Session()
+    s = requests.Session()
     retry = Retry(
-        total=3,
-        backoff_factor=0.5,
+        total=3, backoff_factor=0.5,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"],
     )
     adapter = HTTPAdapter(max_retries=retry, pool_maxsize=32)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update(HEADERS)
-    return session
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update(HEADERS)
+    return s
 
 
 # ============================================================
-# Scope resolution
+# URL + scope
 # ============================================================
 
 SKIP_SCHEMES = {"data", "blob", "javascript", "mailto", "tel", "file", "about"}
@@ -147,7 +145,6 @@ INLINE_SCRIPT_RE = re.compile(r"<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)</script>"
 def extract_scripts(base_url, html):
     soup = BeautifulSoup(html, "html.parser")
     js_files = set()
-
     base_tag = soup.find("base", href=True)
     effective_base = urljoin(base_url, base_tag["href"]) if base_tag else base_url
 
@@ -158,12 +155,10 @@ def extract_scripts(base_url, html):
         absolute = normalize_url(src, base=effective_base)
         if absolute:
             js_files.add(absolute)
-
     return js_files
 
 
 def extract_inline_scripts(html):
-    """Return list of (index, source) for inline <script> blocks."""
     return [(i, m.group(1)) for i, m in enumerate(INLINE_SCRIPT_RE.finditer(html or ""))]
 
 
@@ -244,7 +239,7 @@ def download_all(js_urls: Iterable[str], workers=DEFAULT_WORKERS):
 
 
 # ============================================================
-# Detector (filename / banner / body)
+# Library detector
 # ============================================================
 
 VERSION_PATTERNS = [
@@ -348,8 +343,7 @@ SKIP_HOSTS = {"example.com", "example.org", "localhost", "test.com",
 
 def _is_ip(s):
     try:
-        ipaddress.ip_address(s)
-        return True
+        ipaddress.ip_address(s); return True
     except ValueError:
         return False
 
@@ -419,7 +413,7 @@ def extract_domains(downloads, target=None):
 
 
 # ============================================================
-# GraphQL detector
+# GraphQL
 # ============================================================
 
 GRAPHQL_ENDPOINT_PATTERNS = [
@@ -499,7 +493,7 @@ def detect_graphql(downloads, base_url=None):
 
 
 # ============================================================
-# WebSocket detector
+# WebSocket / SSE
 # ============================================================
 
 WS_URL_RE = re.compile(r'["\'`](wss?://[^"\'`\s]+)["\'`]', re.I)
@@ -624,436 +618,713 @@ def analyze_comments(downloads):
 
 
 # ============================================================
-# Correlator (now indexes security findings too)
+# Security: helpers
 # ============================================================
 
-def _host(url):
-    try:
-        return urlparse(url).netloc.split(":")[0].lower()
-    except Exception:
-        return ""
+def line_col(text, offset):
+    line = text.count("\n", 0, offset) + 1
+    col = offset - text.rfind("\n", 0, offset)
+    return line, col
 
 
-class Correlator:
-    def __init__(self, downloads, findings, secrets=None, endpoints=None,
-                 domains=None, comments=None, graphql=None, websockets=None,
-                 entropy=None, crypto=None):
-        self.downloads = downloads
-        self.findings = findings or []
-        self.secrets = secrets
-        self.endpoints = endpoints
-        self.domains = domains
-        self.comments = comments
-        self.graphql = graphql
-        self.websockets = websockets
-        self.entropy = entropy
-        self.crypto = crypto
+def _context(text, offset, lines=3):
+    parts = text.splitlines()
+    ln = text.count("\n", 0, offset)
+    start = max(0, ln - lines)
+    end = min(len(parts), ln + lines + 1)
+    return "\n".join(f"{i+1:5} | {parts[i]}" for i in range(start, end))
 
-        self.by_hash = defaultdict(list)
-        self.by_host = defaultdict(set)
-        self.per_file = defaultdict(dict)
 
-    # --------------------------------------------------------
-    def run(self):
-        self._index_downloads()
-        self._index_findings()
-        self._index_secrets()
-        self._index_entropy()
-        self._index_endpoints()
-        self._index_domains()
-        self._index_comments()
-        self._index_crypto()
-        return self.report()
+def find_function(text, offset):
+    before = text[:offset]
+    patterns = [
+        r"function\s+([A-Za-z0-9_$]+)",
+        r"([A-Za-z0-9_$]+)\s*=\s*\([^)]*\)\s*=>",
+        r"([A-Za-z0-9_$]+)\s*:\s*function",
+        r"class\s+([A-Za-z0-9_$]+)",
+    ]
+    nearest, pos = None, -1
+    for pat in patterns:
+        for m in re.finditer(pat, before):
+            if m.start() > pos:
+                pos, nearest = m.start(), m.group(1)
+    return nearest
 
-    # --------------------------------------------------------
-    def _index_downloads(self):
-        for d in self.downloads:
-            if d.get("status") != 200:
+
+def _finding(text, url, offset, **kw):
+    ln, col = line_col(text, offset)
+    base = {
+        "file": url, "offset": offset, "line": ln, "column": col,
+        "context": _context(text, offset),
+        "function": find_function(text, offset),
+    }
+    base.update(kw)
+    return base
+
+
+# ============================================================
+# Security: secrets
+# ============================================================
+
+SECRET_PATTERNS = {
+    "Google API Key":         [r"AIza[0-9A-Za-z\-_]{35}"],
+    "Firebase URL":           [r"https://[A-Za-z0-9\-]+\.firebaseio\.com"],
+    "Firebase Storage":       [r"[A-Za-z0-9\-]+\.appspot\.com"],
+    "AWS Access Key":         [r"AKIA[0-9A-Z]{16}"],
+    "AWS ARN":                [r"arn:aws:[^\s\"']+"],
+    "S3 Bucket":              [r"https?://[A-Za-z0-9.\-]+\.s3(?:[.-][A-Za-z0-9-]+)?\.amazonaws\.com"],
+    "Azure Storage":          [r"DefaultEndpointsProtocol=https;AccountName=.*?AccountKey=.*?;"],
+    "Stripe Publishable Key": [r"pk_(?:live|test)_[A-Za-z0-9]{24,}"],
+    "Stripe Secret Key":      [r"sk_(?:live|test)_[A-Za-z0-9]{24,}"],
+    "Slack Webhook":          [r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+"],
+    "Discord Webhook":        [r"https://discord(?:app)?\.com/api/webhooks/[^\s\"']+"],
+    "SendGrid API Key":       [r"SG\.[A-Za-z0-9_\-]{22,}\.[A-Za-z0-9_\-]{43,}"],
+    "Mailgun API Key":        [r"key-[0-9a-f]{32}"],
+    "Twilio SID":             [r"AC[a-fA-F0-9]{32}"],
+    "JWT":                    [r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"],
+    "Bearer Token":           [r"Bearer\s+[A-Za-z0-9\-._~+/]+=*"],
+    "Basic Auth":             [r"Basic\s+[A-Za-z0-9+/=]{8,}"],
+    "Private Key":            [r"-----BEGIN (?:RSA|EC|OPENSSH|PRIVATE) KEY-----[\s\S]+?-----END (?:RSA|EC|OPENSSH|PRIVATE) KEY-----"],
+    "GitHub Token":           [r"gh[pousr]_[A-Za-z0-9]{36,255}"],
+    "GitLab Token":           [r"glpat-[A-Za-z0-9\-_]{20,}"],
+    "Generic API Key":        [r'(?i)(?:api[_-]?key|apikey|client[_-]?secret|secret)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{16,})'],
+    "OpenAI Key":             [r"sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}"],
+    "Anthropic Key":          [r"sk-ant-[A-Za-z0-9\-_]{40,}"],
+    "Mapbox Token":           [r"pk\.[A-Za-z0-9]{60,}\.[A-Za-z0-9\-_]{20,}"],
+    "Supabase Key":           [r"eyJ[A-Za-z0-9_-]{20,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}"],
+}
+
+SEVERITY = {
+    "HIGH": {
+        "AWS Access Key", "Stripe Secret Key", "Private Key",
+        "GitHub Token", "GitLab Token", "Azure Storage",
+        "SendGrid API Key", "Mailgun API Key", "OpenAI Key", "Anthropic Key",
+    },
+    "MEDIUM": {"JWT", "Bearer Token", "Basic Auth", "Generic API Key",
+               "Twilio SID", "Mapbox Token", "Supabase Key"},
+}
+
+NO_VALIDATE = {"Generic API Key", "Bearer Token", "Basic Auth", "AWS ARN",
+               "S3 Bucket", "Firebase URL", "Firebase Storage"}
+
+
+def _severity(name):
+    if name in SEVERITY["HIGH"]:
+        return "HIGH"
+    if name in SEVERITY["MEDIUM"]:
+        return "MEDIUM"
+    return "LOW"
+
+
+class SecretValidator:
+    def validate(self, secret_type, value):
+        method = getattr(
+            self,
+            "validate_" + secret_type.lower().replace(" ", "_").replace("-", "_"),
+            None,
+        )
+        return method(value) if method else True
+
+    def validate_jwt(self, token):
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        try:
+            for p in parts[:2]:
+                base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))
+            return True
+        except Exception:
+            return False
+
+    def validate_aws_access_key(self, k):
+        return bool(re.fullmatch(r"AKIA[0-9A-Z]{16}", k))
+
+    def validate_google_api_key(self, k):
+        return bool(re.fullmatch(r"AIza[0-9A-Za-z\-_]{35}", k))
+
+    def validate_stripe_secret_key(self, k):
+        return bool(re.fullmatch(r"sk_(live|test)_[A-Za-z0-9]{24,}", k))
+
+    def validate_stripe_publishable_key(self, k):
+        return bool(re.fullmatch(r"pk_(live|test)_[A-Za-z0-9]{24,}", k))
+
+    def validate_github_token(self, t):
+        return t.startswith(("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_"))
+
+    def validate_gitlab_token(self, t):
+        return t.startswith("glpat-")
+
+    def validate_openai_key(self, k):
+        return bool(re.fullmatch(r"sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}", k))
+
+    def validate_anthropic_key(self, k):
+        return k.startswith("sk-ant-")
+
+    def validate_supabase_key(self, k):
+        return self.validate_jwt(k)
+
+
+class SecretScanner:
+    def __init__(self, validate=True):
+        self.patterns = SECRET_PATTERNS
+        self.validator = SecretValidator() if validate else None
+        self.findings = []
+
+    def scan(self, url, text):
+        if not text:
+            return []
+        found = []
+        for name, regexes in self.patterns.items():
+            for rx in regexes:
+                for m in re.finditer(rx, text, re.MULTILINE):
+                    raw = m.group(0)
+                    validated = None
+                    if self.validator and name not in NO_VALIDATE:
+                        try:
+                            validated = self.validator.validate(name, raw)
+                        except Exception:
+                            validated = None
+                    if validated is False:
+                        continue
+                    found.append(_finding(
+                        text, url, m.start(),
+                        type=name, severity=_severity(name),
+                        raw=raw,
+                        masked=(raw[:6] + "*****" + raw[-4:]) if len(raw) > 12 else raw,
+                        validated=validated,
+                    ))
+        seen, unique = set(), []
+        for f in found:
+            key = (f["type"], f["offset"], f["file"])
+            if key in seen:
                 continue
-            url = d["url"]
-            self.by_hash[d["sha256"]].append(url)
-            self.by_host[_host(url)].add(url)
-            self.per_file[url].update({
-                "size": d.get("size"),
-                "sha256": d.get("sha256"),
-                "has_source_map": bool(d.get("source_map")),
-                "has_banner": bool(d.get("banner")),
-            })
+            seen.add(key)
+            unique.append(f)
+        self.findings.extend(unique)
+        unique.sort(key=lambda x: (x["severity"] != "HIGH", x["type"]))
+        return unique
 
-    def _index_findings(self):
-        for f in self.findings:
-            url = f.get("url")
-            if not url:
-                continue
-            # findings may be grouped (library/version list) OR per-file
-            if isinstance(url, list):
-                for u in url:
-                    self.per_file[u].setdefault("libraries", []).append({
-                        "name": f.get("library"),
-                        "version": f.get("version"),
-                        "confidence": f.get("confidence"),
-                    })
-            else:
-                self.per_file[url].setdefault("libraries", []).append({
-                    "name": f.get("library"),
-                    "version": f.get("version"),
-                    "confidence": f.get("confidence"),
-                })
-
-    # --------------------------------------------------------
-    # NEW: secrets now come from security.SecretScanner
-    # --------------------------------------------------------
-    def _index_secrets(self):
-        if not self.secrets:
-            return
-        items = getattr(self.secrets, "findings", None) or self.secrets
-        for s in items:
-            url = s.get("file") or s.get("url")
-            if not url:
-                continue
-            self.per_file[url].setdefault("secrets", []).append({
-                "type": s.get("type"),
-                "severity": s.get("severity"),
-                "validated": s.get("validated"),
-                "masked": s.get("masked") or (s.get("raw") or "")[:12],
-                "line": s.get("line"),
-            })
-
-    # --------------------------------------------------------
-    # NEW: entropy hits
-    # --------------------------------------------------------
-    def _index_entropy(self):
-        if not self.entropy:
-            return
-        items = getattr(self.entropy, "findings", None) or self.entropy
-        for e in items:
-            url = e.get("file") or e.get("url")
-            if not url:
-                continue
-            self.per_file[url].setdefault("entropy", []).append({
-                "entropy": e.get("entropy"),
-                "masked": e.get("masked"),
-                "line": e.get("line"),
-            })
-
-    # --------------------------------------------------------
-    # NEW: crypto usage
-    # --------------------------------------------------------
-    def _index_crypto(self):
-        if not self.crypto:
-            return
-        per_file = getattr(self.crypto, "findings", None) or []
-        for entry in per_file:
-            url = entry.get("file")
-            if not url:
-                continue
-            libs  = [x["type"] for x in entry.get("libraries", [])]
-            algos = [x["type"] for x in entry.get("algorithms", [])]
-            if libs or algos:
-                self.per_file[url].setdefault("crypto", {
-                    "libraries":  sorted(set(libs)),
-                    "algorithms": sorted(set(algos)),
-                })
-
-    # --------------------------------------------------------
-    # endpoints: works with EndpointExtractor.report()
-    # --------------------------------------------------------
-    def _index_endpoints(self):
-        if not self.endpoints:
-            return
-        # Accept either an EndpointExtractor instance or a raw dict/list
-        if hasattr(self.endpoints, "report"):
-            items = self.endpoints.report().get("endpoints", [])
-        else:
-            items = self.endpoints
-            if isinstance(items, dict):
-                items = items.get("endpoints", [])
-
-        for e in items or []:
-            target = e.get("endpoint") or e.get("url")
-            srcs = e.get("found_in") or e.get("file") or []
-            if isinstance(srcs, str):
-                srcs = [srcs]
-            for u in srcs:
-                self.per_file[u].setdefault("endpoints", []).append({
-                    "endpoint": target,
-                    "type": e.get("type"),
-                    "confidence": e.get("confidence"),
-                })
-
-    def _index_domains(self):
-        if not self.domains:
-            return
-        rep = self.domains.report() if hasattr(self.domains, "report") else self.domains
-        for d in rep.get("domains", []):
-            for file in d.get("found_in", []):
-                self.per_file[file].setdefault("domains", []).append(d["domain"])
-
-    def _index_comments(self):
-        if not self.comments:
-            return
-        rep = self.comments.report() if hasattr(self.comments, "report") else self.comments
-        for tag, hits in rep.get("interesting", {}).items():
-            for h in hits:
-                self.per_file[h["file"]].setdefault("comment_flags", []).append(tag)
-
-    # --------------------------------------------------------
     def report(self):
-        duplicates = {h: urls for h, urls in self.by_hash.items() if len(urls) > 1}
-
-        host_libs = defaultdict(set)
-        for url, info in self.per_file.items():
-            for lib in info.get("libraries", []):
-                host_libs[_host(url)].add(f"{lib['name']}@{lib['version']}")
-
-        families = defaultdict(list)
-        for url in self.per_file:
-            h = _host(url)
-            path = urlparse(url).path
-            base = (path.rsplit("/", 1)[-1] or path).split(".")[0]
-            families[(h, base)].append(url)
-
-        risky = []
-        for url, info in self.per_file.items():
-            secrets = info.get("secrets", [])
-            # weight by severity + validated
-            score = 0
-            for s in secrets:
-                sev = (s.get("severity") or "").upper()
-                w = {"HIGH": 10, "MEDIUM": 5, "LOW": 2}.get(sev, 1)
-                if s.get("validated") is True:
-                    w *= 2
-                score += w
-            score += len(info.get("comment_flags", []))
-            score += 2 if info.get("has_source_map") else 0
-            score += len(info.get("entropy", []))
-            score += 1 if info.get("crypto", {}).get("libraries") else 0
-
-            if score:
-                risky.append({
-                    "url": url, "score": score,
-                    "flags": {
-                        "secrets": len(secrets),
-                        "entropy": len(info.get("entropy", [])),
-                        "comments": info.get("comment_flags", []),
-                        "crypto": info.get("crypto", {}),
-                        "has_source_map": info.get("has_source_map", False),
-                    },
-                })
-        risky.sort(key=lambda r: -r["score"])
-
+        counts = defaultdict(int)
+        for f in self.findings:
+            counts[f["severity"]] += 1
         return {
-            "hosts": sorted(self.by_host.keys()),
-            "files": len(self.per_file),
-            "duplicates": [{"sha256": h, "urls": u} for h, u in duplicates.items()],
-            "host_libraries": {h: sorted(l) for h, l in host_libs.items()},
-            "bundle_families": [
-                {"host": h, "base": b, "urls": u}
-                for (h, b), u in families.items() if len(u) > 1
-            ],
-            "risky_files": risky,
-            "per_file": dict(self.per_file),
+            "total": len(self.findings),
+            "by_severity": dict(counts),
+            "findings": self.findings,
         }
 
 
-def correlate(downloads, findings, **extra):
-    return Correlator(downloads, findings, **extra).run()
+# ============================================================
+# Security: entropy
+# ============================================================
+
+URL_LIKE = re.compile(r"^https?://|^/|^\.{0,2}/")
+HASH_LIKE = re.compile(r"^[a-f0-9]{32,64}$", re.I)
+
+
+class EntropyDetector:
+    def __init__(self, min_length=20, min_entropy=4.3):
+        self.min_length = min_length
+        self.min_entropy = min_entropy
+        self.ignore = {"true", "false", "null", "undefined", "localhost"}
+        self.findings = []
+
+    def shannon(self, s):
+        if not s:
+            return 0.0
+        e = 0.0
+        for c in set(s):
+            p = s.count(c) / len(s)
+            e -= p * math.log2(p)
+        return e
+
+    def scan(self, url, text):
+        if not text:
+            return []
+        found = []
+        pattern = r'["\'`]([A-Za-z0-9+/=_\-]{20,})["\'`]'
+        for m in re.finditer(pattern, text):
+            value = m.group(1)
+            if value.lower() in self.ignore:
+                continue
+            if URL_LIKE.match(value) or HASH_LIKE.match(value):
+                continue
+            ent = self.shannon(value)
+            if ent < self.min_entropy:
+                continue
+            found.append(_finding(
+                text, url, m.start(1),
+                type="High Entropy String", severity="MEDIUM",
+                entropy=round(ent, 2),
+                confidence=min(100, int(ent * 18)),
+                masked=value[:6] + "*****" + value[-4:],
+                length=len(value),
+            ))
+        self.findings.extend(found)
+        return found
+
+    def report(self):
+        return {"total": len(self.findings), "findings": self.findings}
 
 
 # ============================================================
-# CLI
+# Security: crypto
 # ============================================================
 
-def cmd_scan(args):
-    print("=" * 60)
-    print(" LibFinder - JavaScript Recon Toolkit")
-    print("=" * 60)
+CRYPTO_LIBRARIES = {
+    "CryptoJS":    [r"\bCryptoJS\b"],
+    "WebCrypto":   [r"crypto\.subtle"],
+    "Forge":       [r"\bforge\."],
+    "SJCL":        [r"\bsjcl\b"],
+    "TweetNaCl":   [r"\bnacl\."],
+    "Node Crypto": [r"require\(['\"]crypto['\"]\)"],
+    "libsodium":   [r"\bsodium\b"],
+}
+ALGORITHMS = {
+    "AES":     [r"AES\.(?:encrypt|decrypt)", r"subtle\.(?:encrypt|decrypt)"],
+    "RSA":     [r"\bRSA\b", r"JSEncrypt"],
+    "PBKDF2":  [r"\bPBKDF2\b"],
+    "HMAC":    [r"HmacSHA", r"\bHMAC\b"],
+    "SHA256":  [r"\bSHA256\b", r"SHA-256"],
+    "SHA1":    [r"\bSHA1\b", r"SHA-1"],
+    "MD5":     [r"\bMD5\b"],
+    "ChaCha20":[r"ChaCha20"],
+    "Ed25519": [r"Ed25519"],
+}
+MODES = {
+    "CBC": [r"mode\.CBC"], "GCM": [r"\bGCM\b"], "CTR": [r"\bCTR\b"],
+    "ECB": [r"mode\.ECB"], "OFB": [r"mode\.OFB"], "CFB": [r"mode\.CFB"],
+}
+PADDINGS = {
+    "Pkcs7": [r"pad\.Pkcs7"], "ZeroPadding": [r"ZeroPadding"],
+    "NoPadding": [r"NoPadding"], "ISO10126": [r"pad\.ISO10126"],
+    "AnsiX923": [r"pad\.AnsiX923"],
+}
 
+
+class CryptoAnalyzer:
+    def __init__(self):
+        self.findings = []
+
+    def _detect(self, url, text, patterns, kind):
+        out = []
+        for name, regexes in patterns.items():
+            for rx in regexes:
+                for m in re.finditer(rx, text, re.I):
+                    out.append(_finding(
+                        text, url, m.start(),
+                        type=name, kind=kind, severity="INFO",
+                        match=m.group(0),
+                    ))
+        return out
+
+    def analyze(self, url, text):
+        if not text:
+            return {}
+        result = {
+            "file": url,
+            "libraries":  self._detect(url, text, CRYPTO_LIBRARIES, "library"),
+            "algorithms": self._detect(url, text, ALGORITHMS,       "algorithm"),
+            "modes":      self._detect(url, text, MODES,            "mode"),
+            "padding":    self._detect(url, text, PADDINGS,         "padding"),
+        }
+        self.findings.append(result)
+        return result
+
+    def report(self):
+        libs, algos, modes, pads = set(), set(), set(), set()
+        for r in self.findings:
+            libs.update(x["type"] for x in r["libraries"])
+            algos.update(x["type"] for x in r["algorithms"])
+            modes.update(x["type"] for x in r["modes"])
+            pads.update(x["type"] for x in r["padding"])
+        return {
+            "files_analyzed": len(self.findings),
+            "libraries":  sorted(libs), "algorithms": sorted(algos),
+            "modes":      sorted(modes), "padding": sorted(pads),
+            "per_file":   self.findings,
+        }
+
+
+# ============================================================
+# Security: endpoints
+# ============================================================
+
+IGNORE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".css",
+              ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".webm",
+              ".mp3", ".wav", ".map", ".js")
+
+ENDPOINT_PATTERNS = {
+    "fetch":        r'fetch\s*\(\s*[\'"`]([^\'"`]+)',
+    "axios":        r'axios(?:\.(?:get|post|put|delete|patch|head))?\s*\(\s*[\'"`]([^\'"`]+)',
+    "axios_config": r'url\s*:\s*[\'"`]([^\'"`]+)',
+    "xhr":          r'\.open\s*\(\s*[\'"][A-Z]+[\'"`]\s*,\s*[\'"`]([^\'"`]+)',
+    "jquery":       r'\$\.(?:ajax|get|post)\(\s*[\'"`]([^\'"`]+)',
+    "websocket":    r'new\s+WebSocket\s*\(\s*[\'"`]([^\'"`]+)',
+    "eventsource":  r'new\s+EventSource\s*\(\s*[\'"`]([^\'"`]+)',
+    "graphql":      r'[\'"`]([^\'"`]*?(?:/graphql|/gql)[^\'"`]*?)[\'"`]',
+    "relative_api": r'[\'"`](/api/[^\'"`]*|/v\d+/[^\'"`]*|/rest/[^\'"`]*)[\'"`]',
+}
+
+
+class EndpointExtractor:
+    def __init__(self):
+        self.endpoints = {}
+
+    def _ignore(self, ep):
+        el = ep.lower()
+        return any(el.endswith(x) for x in IGNORE_EXT)
+
+    def _normalize(self, ep, base):
+        if ep.startswith(("http://", "https://", "ws://", "wss://")):
+            return ep
+        return urljoin(base, ep)
+
+    def extract(self, url, text):
+        if not text:
+            return []
+        raw = defaultdict(set)
+        for method, rx in ENDPOINT_PATTERNS.items():
+            for m in re.finditer(rx, text, re.I):
+                ep = self._normalize(m.group(1), url)
+                if self._ignore(ep):
+                    continue
+                raw[ep].add(method)
+
+        results = []
+        for ep, methods in raw.items():
+            if "graphql" in methods:   etype = "GraphQL"
+            elif "websocket" in methods: etype = "WebSocket"
+            elif "eventsource" in methods: etype = "SSE"
+            else: etype = "REST"
+            confidence = min(100, len(methods) * 25 + 40)
+
+            if ep in self.endpoints:
+                self.endpoints[ep]["methods"] = sorted(
+                    set(self.endpoints[ep]["methods"]) | set(methods)
+                )
+                self.endpoints[ep]["found_in"].append(url)
+                self.endpoints[ep]["confidence"] = min(
+                    100, self.endpoints[ep]["confidence"] + 15
+                )
+            else:
+                self.endpoints[ep] = {
+                    "endpoint": ep, "type": etype,
+                    "confidence": confidence,
+                    "methods": sorted(methods),
+                    "found_in": [url],
+                }
+            results.append(self.endpoints[ep])
+        return sorted(results, key=lambda x: -x["confidence"])
+
+    def report(self):
+        return {
+            "total": len(self.endpoints),
+            "endpoints": sorted(
+                self.endpoints.values(),
+                key=lambda x: -x["confidence"],
+            ),
+        }
+
+
+# ============================================================
+# Security: one-shot runner
+# ============================================================
+
+def run_security_analysis(downloads, validate_secrets=True):
+    secrets   = SecretScanner(validate=validate_secrets)
+    entropy   = EntropyDetector()
+    crypto    = CryptoAnalyzer()
+    endpoints = EndpointExtractor()
+
+    for d in downloads:
+        if d.get("status") != 200:
+            continue
+        url, text = d["url"], d.get("text") or ""
+        secrets.scan(url, text)
+        entropy.scan(url, text)
+        crypto.analyze(url, text)
+        endpoints.extract(url, text)
+
+    secret_keys = {(s["file"], s["offset"]) for s in secrets.findings}
+    entropy.findings = [
+        e for e in entropy.findings
+        if (e["file"], e["offset"]) not in secret_keys
+    ]
+
+    return {"secrets": secrets, "entropy": entropy,
+            "crypto": crypto, "endpoints": endpoints}
+
+
+# ============================================================
+# Call graph
+# ============================================================
+
+FUNC_DEF_PATTERNS = [
+    re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", re.M),
+    re.compile(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\s*\(|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)", re.M),
+    re.compile(r"\b([A-Za-z_$][\w$]*)\s*:\s*(?:async\s*)?function\s*\(", re.M),
+]
+CALL_PATTERN = re.compile(r"\b([A-Za-z_$][\w$.]*)\s*\(")
+
+INTERESTING_SINKS = {
+    "eval", "Function", "setTimeout", "setInterval",
+    "fetch", "XMLHttpRequest", "WebSocket", "EventSource",
+    "innerHTML", "outerHTML", "insertAdjacentHTML", "document.write",
+    "postMessage", "document.cookie", "location.href", "location.assign",
+    "atob", "btoa", "crypto.subtle", "require", "execScript",
+}
+IGNORE_CALLS = {
+    "if", "for", "while", "switch", "catch", "return", "typeof",
+    "new", "delete", "void", "in", "of", "do", "else", "function",
+    "class", "super", "this", "yield", "await", "async",
+}
+
+
+def _strip_js(text):
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i) or n
+            for k in range(i, j): out[k] = " "
+            i = j; continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j == -1 else j + 2
+            for k in range(i, j):
+                if out[k] != "\n": out[k] = " "
+            i = j; continue
+        if c in ("'", '"', "`"):
+            q = c; j = i + 1
+            while j < n:
+                if text[j] == "\\": j += 2; continue
+                if text[j] == q: j += 1; break
+                j += 1
+            for k in range(i, j):
+                if out[k] != "\n": out[k] = " "
+            i = j; continue
+        i += 1
+    return "".join(out)
+
+
+def _brace_block(text, start):
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth, i, n = 0, start, len(text)
+    while i < n:
+        if text[i] == "{": depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0: return (start, i)
+        i += 1
+    return None
+
+
+class CallGraph:
+    def __init__(self):
+        self.functions = {}
+        self.callers = {}
+        self.edges = []
+        self.sinks = {}
+
+    def add_file(self, url, text):
+        if not text:
+            return
+        clean = _strip_js(text)
+        self._register_functions(url, clean)
+        self._register_calls(url, clean)
+
+    def _register_functions(self, url, clean):
+        for pat in FUNC_DEF_PATTERNS:
+            for m in pat.finditer(clean):
+                name = m.group(1)
+                brace = clean.find("{", m.end())
+                if brace == -1: continue
+                block = _brace_block(clean, brace)
+                if not block: continue
+                start, end = block
+                key = f"{name}@{url}"
+                if key in self.functions: continue
+                self.functions[key] = {
+                    "name": name, "file": url,
+                    "start": start, "end": end, "calls": set(),
+                }
+
+    def _owner_of(self, url, pos):
+        best, span = None, None
+        for key, fn in self.functions.items():
+            if fn["file"] != url: continue
+            if fn["start"] <= pos <= fn["end"]:
+                s = fn["end"] - fn["start"]
+                if span is None or s < span:
+                    best, span = key, s
+        return best
+
+    def _register_calls(self, url, clean):
+        for m in CALL_PATTERN.finditer(clean):
+            callee = m.group(1)
+            base = callee.split(".")[0]
+            if base in IGNORE_CALLS: continue
+            caller_key = self._owner_of(url, m.start())
+            caller = self.functions[caller_key]["name"] if caller_key else "<top>"
+            if caller_key:
+                self.functions[caller_key]["calls"].add(callee)
+            self.callers.setdefault(callee, set()).add(caller)
+            self.edges.append({"caller": caller, "callee": callee,
+                               "file": url, "pos": m.start()})
+            if callee in INTERESTING_SINKS or base in INTERESTING_SINKS:
+                snippet = clean[max(0, m.start() - 40): m.start() + 80].replace("\n", " ")
+                self.sinks.setdefault(callee, []).append({
+                    "file": url, "caller": caller,
+                    "pos": m.start(), "snippet": snippet.strip(),
+                })
+
+    def sinks_report(self):
+        out = []
+        for sink, hits in sorted(self.sinks.items(), key=lambda kv: -len(kv[1])):
+            out.append({
+                "sink": sink, "hits": len(hits),
+                "files": sorted({h["file"] for h in hits}),
+                "callers": sorted({h["caller"] for h in hits}),
+                "samples": hits[:5],
+            })
+        return out
+
+    def stats(self):
+        return {"functions": len(self.functions), "edges": len(self.edges),
+                "unique_callees": len(self.callers), "sinks": len(self.sinks)}
+
+
+def build_call_graph(downloads):
+    cg = CallGraph()
+    for d in downloads:
+        if d.get("status") == 200 and d.get("text"):
+            cg.add_file(d["url"], d["text"])
+    return cg
+
+
+# ============================================================
+# Source map parser
+# ============================================================
+
+class SourceMapParser:
+    def __init__(self, session=None, fetch=True):
+        self.session = session or create_session()
+        self.fetch = fetch
+        self.maps = {}
+        self.errors = {}
+        self.sources = defaultdict(set)
+        self.sources_content = {}
+
+    def parse(self, js_url, source_map_url):
+        if not source_map_url:
+            return None
+        if source_map_url.startswith("data:"):
+            try:
+                raw = source_map_url.split(",", 1)[1]
+                if ";base64" in source_map_url:
+                    raw = base64.b64decode(raw).decode("utf-8", "replace")
+                data = json.loads(raw)
+                self._record(js_url, data)
+                return data
+            except Exception as e:
+                self.errors[js_url] = f"data-url parse error: {e}"
+                return None
+        if not self.fetch:
+            return None
+        try:
+            r = self.session.get(source_map_url, timeout=DEFAULT_TIMEOUT)
+            if r.status_code != 200:
+                self.errors[js_url] = f"HTTP {r.status_code}"
+                return None
+            data = r.json()
+            self._record(js_url, data)
+            return data
+        except Exception as e:
+            self.errors[js_url] = str(e)
+            return None
+
+    def _record(self, js_url, data):
+        self.maps[js_url] = data
+        for src in data.get("sources", []) or []:
+            self.sources[src].add(js_url)
+        for src, content in zip(
+            data.get("sources", []) or [],
+            data.get("sourcesContent", []) or []
+        ):
+            if content and src not in self.sources_content:
+                self.sources_content[src] = content
+
+    def report(self):
+        return {
+            "maps_parsed": len(self.maps),
+            "unique_sources": len(self.sources),
+            "sources_with_content": len(self.sources_content),
+            "entries": [
+                {"js_file": j, "sources_count": len(d.get("sources") or []),
+                 "has_content": bool(d.get("sourcesContent")),
+                 "source_root": d.get("sourceRoot"), "file": d.get("file"),
+                 "first_sources": (d.get("sources") or [])[:10]}
+                for j, d in self.maps.items()
+            ],
+            "errors": self.errors,
+        }
+
+
+def parse_source_maps(downloads, fetch=True, max_maps=50):
+    p = SourceMapParser(fetch=fetch)
+    count = 0
+    for d in downloads:
+        if d.get("status") != 200 or not d.get("source_map"):
+            continue
+        if count >= max_maps:
+            break
+        url = urljoin(d["url"], d["source_map"])
+        p.parse(d["url"], url)
+        count += 1
+    return p
+
+
+# ============================================================
+# Convenience: run every analyzer in one shot
+# ============================================================
+
+def run_recon(url, validate_secrets=True, fetch_source_maps=True):
+    """Run the entire discovery + analysis pipeline. Returns a dict."""
     session = create_session()
-    scope = ScopeResolver(args.url)
-
-    js_files = get_js_files(args.url, session=session)
-    print(f"\n[+] Target   : {args.url}")
-    print(f"[+] JS files : {len(js_files)}")
-
+    js_files = get_js_files(url, session=session)
     if not js_files:
-        return
+        return {"target": url, "js_files": [], "downloads": [],
+                "libraries": [], "secrets": None, "entropy": None,
+                "crypto": None, "endpoints": None, "domains": None,
+                "graphql": None, "websockets": None, "comments": None,
+                "call_graph": None, "source_maps": None}
 
     downloads = download_all(js_files)
-    findings = detect_all(downloads)
-
-    # ---------- SECURITY PASS (NEW) ----------
-    print("[+] Running security pass...")
-    sec = run_security_analysis(
-        downloads,
-        validate_secrets=not args.no_validate_secrets,
-    )
-    secrets   = sec["secrets"]
-    entropy   = sec["entropy"]
-    crypto    = sec["crypto"]
-    endpoints = sec["endpoints"]
-
-    # ---------- Structural analyzers ----------
-    domains    = extract_domains(downloads, target=args.url)
-    graphql    = detect_graphql(downloads, base_url=args.url)
+    sec        = run_security_analysis(downloads, validate_secrets=validate_secrets)
+    domains    = extract_domains(downloads, target=url)
+    graphql    = detect_graphql(downloads, base_url=url)
     websockets = detect_websockets(downloads)
     comments   = analyze_comments(downloads)
+    callgraph  = build_call_graph(downloads)
+    srcmaps    = parse_source_maps(downloads, fetch=fetch_source_maps)
 
-    # ---------- Correlate ----------
-    correlation = correlate(
-        downloads, findings,
-        secrets=secrets,
-        endpoints=endpoints,
-        domains=domains,
-        comments=comments,
-        graphql=graphql,
-        websockets=websockets,
-        entropy=entropy,
-        crypto=crypto,
-    )
-
-    # ============================================================
-    # OUTPUT
-    # ============================================================
-
-    # -------- Libraries --------
-    print("\n" + "=" * 60)
-    print(" Libraries")
-    print("=" * 60)
-    for f in findings:
-        print(f"  {f['library']:<30} {f['version']:<15} "
-              f"[{f['confidence']}] {f['url']}")
-
-    # -------- Secrets --------
-    srep = secrets.report()
-    print("\n" + "=" * 60)
-    print(f" Secrets ({srep['total']})  {srep['by_severity']}")
-    print("=" * 60)
-    if not secrets.findings:
-        print("  (none)")
-    for s in secrets.findings[:30]:
-        if s.get("validated") is True:
-            mark = "✓"
-        elif s.get("validated") is False:
-            mark = "✗"
-        else:
-            mark = " "
-        print(f"  [{mark}] [{s['severity']:<6}] {s['type']:<22} "
-              f"{s['masked']}  @ {s['file'].split('/')[-1]}:{s['line']}")
-
-    # -------- Entropy --------
-    erep = entropy.report()
-    if erep["total"]:
-        print("\n" + "=" * 60)
-        print(f" High-Entropy Strings ({erep['total']})")
-        print("=" * 60)
-        for e in entropy.findings[:20]:
-            print(f"  H={e['entropy']:<5} {e['masked']}  "
-                  f"@ {e['file'].split('/')[-1]}:{e['line']}")
-
-    # -------- Crypto --------
-    crep = crypto.report()
-    if crep["libraries"] or crep["algorithms"]:
-        print("\n" + "=" * 60)
-        print(" Crypto Usage")
-        print("=" * 60)
-        print(f"  libraries : {', '.join(crep['libraries']) or '-'}")
-        print(f"  algorithms: {', '.join(crep['algorithms']) or '-'}")
-        print(f"  modes     : {', '.join(crep['modes']) or '-'}")
-        print(f"  padding   : {', '.join(crep['padding']) or '-'}")
-
-    # -------- Endpoints --------
-    xrep = endpoints.report()
-    if xrep["total"]:
-        print("\n" + "=" * 60)
-        print(f" Endpoints ({xrep['total']})")
-        print("=" * 60)
-        for e in xrep["endpoints"][:25]:
-            print(f"  [{e['type']:<9}] {e['confidence']:>3}  {e['endpoint']}")
-
-    # -------- Domains --------
-    drep = domains.report()
-    if drep["domains"]:
-        print("\n" + "=" * 60)
-        print(f" Domains ({len(drep['domains'])})")
-        print("=" * 60)
-        for d in drep["domains"]:
-            print(f"  [{d['relationship']:<11}] {d['domain']}  "
-                  f"({len(d['hosts'])} hosts, {len(d['found_in'])} files)")
-
-    # -------- GraphQL --------
-    gql = graphql.report()
-    if gql["endpoints"] or gql["operations"]:
-        print("\n" + "=" * 60)
-        print(" GraphQL")
-        print("=" * 60)
-        for e in gql["endpoints"]:
-            print(f"  endpoint: {e['url']}")
-        for op in gql["operations"]:
-            print(f"  {op['type']:<10} {op['name']}")
-        if gql["introspection_files"]:
-            print(f"  [!] Introspection strings in "
-                  f"{len(gql['introspection_files'])} file(s)")
-
-    # -------- WebSockets --------
-    ws = websockets.report()
-    if ws["websocket_urls"] or ws["constructors"]:
-        print("\n" + "=" * 60)
-        print(" WebSockets / SSE")
-        print("=" * 60)
-        for u in ws["websocket_urls"]:
-            print(f"  url: {u['url']}")
-        for c in ws["constructors"][:10]:
-            print(f"  {c['kind']:<12} in {c['file'].split('/')[-1]}")
-        if ws["protocols"]:
-            print(f"  protocols: {', '.join(ws['protocols'])}")
-
-    # -------- Comments --------
-    rep = comments.report()
-    print("\n" + "=" * 60)
-    print(f" Comments ({rep['total_comments']} total)")
-    print("=" * 60)
-    for tag, hits in rep["interesting"].items():
-        print(f"  {tag:<14} x{len(hits)}")
-
-    # -------- Risky Files --------
-    print("\n" + "=" * 60)
-    print(" Risky Files")
-    print("=" * 60)
-    for r in correlation["risky_files"][:20]:
-        print(f"  score={r['score']:<3} {r['url']}")
-
-    # -------- JSON export --------
-    if args.json:
-        out = {
-            "target": args.url,
-            "findings": findings,
-            "secrets": srep,
-            "entropy": erep,
-            "crypto": crep,
-            "endpoints": xrep,
-            "domains": drep,
-            "graphql": gql,
-            "websockets": ws,
-            "comments": rep,
-            "correlation": correlation,
-        }
-        Path(args.json).write_text(
-            json.dumps(out, indent=2, default=str),
-            encoding="utf-8",
-        )
-        print(f"\n[+] JSON report written to {args.json}")
-
-
-def main():
-    p = argparse.ArgumentParser(description="LibFinder - JS recon toolkit")
-    p.add_argument("-u", "--url", required=True, help="Target URL")
-    p.add_argument("--json", help="Write a JSON report to this path")
-    p.add_argument("--no-validate-secrets", action="store_true",
-                   help="Skip secret validation (faster, more FPs)")
-    args = p.parse_args()
-    cmd_scan(args)
-
-
-if __name__ == "__main__":
-    main()
+    return {
+        "target": url,
+        "js_files": sorted(js_files),
+        "downloads": downloads,
+        "libraries": detect_all(downloads),
+        "secrets": sec["secrets"],
+        "entropy": sec["entropy"],
+        "crypto": sec["crypto"],
+        "endpoints": sec["endpoints"],
+        "domains": domains,
+        "graphql": graphql,
+        "websockets": websockets,
+        "comments": comments,
+        "call_graph": callgraph,
+        "source_maps": srcmaps,
+    }
